@@ -25,6 +25,16 @@ class Chef
       class Dnf < Chef::Provider::Package
         extend Chef::Mixin::Which
 
+        Version = Struct.new(:name, :version, :arch) do
+          def to_s
+            "#{x.name}-#{x.version}.#{x.arch}"
+          end
+
+          def version_with_arch
+            "#{x.version}.#{x.arch}" unless verison.nil?
+          end
+        end
+
         attr_accessor :python_helper
 
         class PythonHelper
@@ -56,16 +66,12 @@ class Chef
             start if stdin.nil?
           end
 
+          # @returns Array<Version>
           def whatprovides(package_name)
-            res = []
             with_helper do
               stdin.syswrite "whatprovides #{package_name}\n"
-              res = stdout.sysread(4096).split
+              stdout.sysread(4096).split.each_slice(3).map { |x| Version.new(x) }
             end
-            return {
-              real_name: res[0],
-              version: res[1],
-            }
           end
 
           def restart
@@ -108,35 +114,18 @@ class Chef
         end
 
         def candidate_version
-          @candidate_version ||=
-            begin
-              @real_name ||= {}
-              package_name_array.map do |package_name|
-                whatprovides = python_helper.whatprovides(package_name)
-                version      = whatprovides[:version]
-                real_name    = whatprovides[:real_name]
-                Chef::Log.debug("#{new_resource} found candidate_version of #{version.nil? ? "nil" : version} for #{real_name}")
-                @real_name[package_name] = real_name
-                version
-              end
-            end
+          resolve_packages if @candidate_version.nil?
+          @candidate_version
         end
 
-        def resolve_installed_version(pkg)
-          query = rpm("--queryformat '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' --whatprovides -q", pkg)
-          if query.exitstatus != 0
-            Chef::Log.debug("#{new_resource} did not find installed_version for #{pkg}")
-            nil
-          else
-            version = query.stdout.chomp
-            Chef::Log.debug("#{new_resource} found installed_version of #{version} for #{pkg}")
-            version
-          end
-        end
-
+        # get_current_versions may not guess 'the' correct version that we later pick from
+        # what is returned first for the available versions, but it will pick 'a' correct
+        # version that satisfies what the user asked for -- which is good enough for an
+        # idempotency check.  later if we fail the idempotency check, we will call the
+        # machinery in resolve_package() and fix the current_version if we have to.
         def get_current_versions
           package_name_array.map do |pkg|
-            resolve_installed_version(pkg)
+            installed_versions(pkg).first.version_with_arch
           end
         end
 
@@ -155,6 +144,56 @@ class Chef
 
         private
 
+        # @returns Array<Version>
+        def available_versions(package_name)
+          python_helper.whatavailable(package_name)
+        end
+
+        # @returns Array<Version>
+        def installed_versions(package_name)
+          python_helper.whatinstalled(package_name)
+        end
+
+        # here is where all the magic is.  the available versions must be returned
+        # by the python helper in the preferred order.  if we find an available verison
+        # that matches something that is installed we pick that one.  if nothing
+        # matches then we pick whatever the python script returned first.
+        def resolve_package(package_name)
+          available_list = available_versions(package_name)
+          installed_list = installed_versions(package_name)
+          # pick the first one that matches an installed version
+          available = available_list.find do |a|
+            installed_list.any? do |i|
+              a.matches_name_and_arch?(i)
+            end
+          end
+          # pick the first one as a default if we didn't match
+          available ||= available_list.first
+          # find the first matching installed version (nil if we don't match)
+          installed = installed_list.find do |i|
+            i.matches_name_and_arch?(available)
+          end
+          # normally we wouldn't update the current_resource, but in this case we
+          # are actually at the point where we really know what the installed version should be
+          # (we do NOT do this resolution early because we want to avoid expensively
+          # resolving the candidate_version for the idempotency check)
+          current_resource.version[package_name] = installed.version_with_arch if installed
+          candidate_version[package_name] = available.version_with_arch if available
+          real_name[package_name] = available.name if available
+        end
+
+        # loop over all the packages and resolve them to find the candidate_version, the
+        # real_name (i.e. dnf_package "/usr/bin/perl" becomes "perl" because we support
+        # whatprovides syntax), and then we fix up the current_resource.version that is
+        # installed.
+        def resolve_packages
+          @candidate_version ||= {}
+          @real_name ||= {}
+          package_name_array.map do |pkg|
+            resolve_package(pkg)
+          end
+        end
+
         def zip(names, versions)
           names.zip(versions).map do |n, v|
             (v.nil? || v.empty?) ? n : "#{@real_name[n]}-#{v}"
@@ -163,10 +202,6 @@ class Chef
 
         def dnf(*args)
           shell_out_with_timeout!(a_to_s("dnf", *args))
-        end
-
-        def rpm(*args)
-          shell_out_with_timeout(a_to_s("rpm", *args))
         end
 
       end
